@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) Meta, Inc. and its affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -102,6 +102,23 @@ class HEncLayer(nn.Module):
         self.empty = empty
         self.norm = norm
         self.pad = pad
+
+        ## print all arguments
+        print("HEncLayer arguments:")
+        print(f"chin: {chin}")
+        print(f"chout: {chout}")
+        print(f"kernel_size: {kernel_size}")
+        print(f"stride: {stride}")
+        print(f"norm: {norm}")
+        print(f"context: {context}")
+        print(f"dconv: {dconv}")
+        print(f"dconv_kw: {dconv_kw}")
+        print(f"pad: {pad}")
+        print(f"rewrite: {rewrite}")
+        print(f"freq: {freq}")
+        print(f"empty: {empty}")
+
+
         if freq:
             kernel_size = [kernel_size, 1]
             stride = [stride, 1]
@@ -155,6 +172,133 @@ class HEncLayer(nn.Module):
         else:
             z = y
         return z
+    
+class HEncLayerNew(nn.Module):
+    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, empty=False,
+                 freq=True, dconv=True, norm=True, context=0, dconv_kw={}, pad=True,
+                 rewrite=True):
+        """Encoder layer. This used both by the time and the frequency branch.
+
+        Args:
+            chin: number of input channels.
+            chout: number of output channels.
+            norm_groups: number of groups for group norm.
+            empty: used to make a layer with just the first conv. this is used
+                before merging the time and freq. branches.
+            freq: this is acting on frequencies.
+            dconv: insert DConv residual branches.
+            norm: use GroupNorm.
+            context: context size for the 1x1 conv.
+            dconv_kw: list of kwargs for the DConv class.
+            pad: pad the input. Padding is done so that the output size is
+                always the input size / stride.
+            rewrite: add 1x1 conv at the end of the layer.
+        """
+        super().__init__()
+        norm_fn = lambda d: nn.Identity()  # noqa
+        if norm:
+            norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa
+        
+        self.freq = freq
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.empty = empty
+        self.norm = norm
+        self.pad = pad
+        
+        if freq:
+            # Use 1D conv along frequency axis
+            kernel_size = kernel_size
+            stride = stride
+            pad = kernel_size // 4 if pad else 0
+            klass = nn.Conv1d
+            self.use_freq_reshape = True
+        else:
+            if pad:
+                pad = kernel_size // 4
+            else:
+                pad = 0
+            klass = nn.Conv1d
+            self.use_freq_reshape = False
+            
+        self.conv = klass(chin, chout, kernel_size, stride, pad)
+        if self.empty:
+            return
+        self.norm1 = norm_fn(chout)
+        self.rewrite = None
+        if rewrite:
+            self.rewrite = klass(chout, 2 * chout, 1 + 2 * context, 1, context)
+            self.norm2 = norm_fn(2 * chout)
+
+        self.dconv = None
+        if dconv:
+            self.dconv = DConv(chout, **dconv_kw)
+
+    def forward(self, x, inject=None):
+        """
+        `inject` is used to inject the result from the time branch into the frequency branch,
+        when both have the same stride.
+        """
+        original_shape = None
+        
+        if self.freq and self.use_freq_reshape:
+            # Reshape from [B, C, Freq, Time] to [B*Time, C, Freq] for 1D conv along freq axis
+            B, C, Fr, T = x.shape
+            original_shape = (B, C, Fr, T)
+            x = x.permute(0, 3, 1, 2).reshape(B * T, C, Fr)
+        
+        if not self.freq and x.dim() == 4:
+            B, C, Fr, T = x.shape
+            x = x.view(B, -1, T)
+
+        # CRITICAL FIX: Add missing time domain padding logic
+        if not self.freq:
+            le = x.shape[-1]
+            if not le % self.stride == 0:
+                x = F.pad(x, (0, self.stride - (le % self.stride)))
+
+        y = self.conv(x)
+        
+        if self.empty:
+            if original_shape:
+                BT, C_out, Fr_out = y.shape
+                B, C, Fr, T = original_shape
+                y = y.view(B, T, C_out, Fr_out).permute(0, 2, 3, 1)
+            return y
+        
+        # KEY FIX: Reshape back to 4D before normalization for equivalence
+        if original_shape:
+            # Reshape back to 4D for normalization: [B*T, C_out, Fr_out] -> [B, C_out, Fr_out, T]
+            BT, C_out, Fr_out = y.shape
+            B, C, Fr, T = original_shape
+            y = y.view(B, T, C_out, Fr_out).permute(0, 2, 3, 1)  # [B, C_out, Fr_out, T]
+        
+        # Apply normalization on 4D tensor (same as original)
+        y = F.gelu(self.norm1(y))
+        if self.dconv:
+            if self.freq:
+                B, C, Fr, T = y.shape
+                y = y.permute(0, 2, 1, 3).reshape(-1, C, T)
+            y = self.dconv(y)
+            if self.freq:
+                y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
+        if self.rewrite:
+            if self.freq and hasattr(self, 'use_freq_reshape') and self.use_freq_reshape:
+                # Apply rewrite convolution using 1D approach with reshaping
+                B, C, Fr, T = y.shape
+                y_reshaped = y.permute(0, 3, 1, 2).reshape(B * T, C, Fr)
+                z_reshaped = self.rewrite(y_reshaped)
+                C_out = z_reshaped.shape[1]
+                z = z_reshaped.view(B, T, C_out, Fr).permute(0, 2, 3, 1)
+                z = self.norm2(z)
+            else:
+                z = self.norm2(self.rewrite(y))
+            z = F.glu(z, dim=1)
+        else:
+            z = y
+        return z
+
+
 
 
 class MultiWrap(nn.Module):
@@ -277,6 +421,23 @@ class HDecLayer(nn.Module):
         self.kernel_size = kernel_size
         self.norm = norm
         self.context_freq = context_freq
+
+
+        ## print all arguments
+        print("HDecLayer arguments:")
+        print(f"chin: {chin}")
+        print(f"chout: {chout}")
+        print(f"last: {last}")
+        print(f"kernel_size: {kernel_size}")
+        print(f"stride: {stride}")
+        print(f"norm: {norm}")
+        print(f"context: {context}")
+        print(f"dconv: {dconv}")
+        print(f"dconv_kw: {dconv_kw}")
+        print(f"pad: {pad}")
+        print(f"context_freq: {context_freq}")
+        print(f"rewrite: {rewrite}")
+
         klass = nn.Conv1d
         klass_tr = nn.ConvTranspose1d
         if freq:
@@ -333,6 +494,113 @@ class HDecLayer(nn.Module):
         if not self.last:
             z = F.gelu(z)
         return z, y
+    
+class HDecLayerNew(nn.Module):
+    def __init__(self, chin, chout, last=False, kernel_size=8, stride=4, norm_groups=1, empty=False,
+                 freq=True, dconv=True, norm=True, context=1, dconv_kw={}, pad=True,
+                 context_freq=True, rewrite=True):
+        """
+        Same as HEncLayer but for decoder. See `HEncLayer` for documentation.
+        """
+        super().__init__()
+        norm_fn = lambda d: nn.Identity()  # noqa
+        if norm:
+            norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa
+        if pad:
+            pad = kernel_size // 4
+        else:
+            pad = 0
+        self.pad = pad
+        self.last = last
+        self.freq = freq
+        self.chin = chin
+        self.empty = empty
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.norm = norm
+        self.context_freq = context_freq
+
+        ## print all arguments
+        print("HDecLayerNew arguments:")
+        print(f"chin: {chin}")
+        print(f"chout: {chout}")
+        print(f"last: {last}")
+        print(f"kernel_size: {kernel_size}")
+        print(f"stride: {stride}")
+        print(f"norm: {norm}")
+        print(f"context: {context}")
+        print(f"dconv: {dconv}")
+        print(f"dconv_kw: {dconv_kw}")
+        print(f"pad: {pad}")
+        print(f"context_freq: {context_freq}")
+        print(f"rewrite: {rewrite}")
+        
+        # Always use 1D transpose convolution for main operation
+        self.conv_tr = nn.ConvTranspose1d(chin, chout, kernel_size, stride)
+        self.norm2 = norm_fn(chout)
+        if self.empty:
+            return
+        # Match HDecLayer rewrite logic exactly (no mixed strides in rewrite layers)
+        klass = nn.Conv1d
+        if freq:
+            klass = nn.Conv2d
+            
+        self.rewrite = None
+        if rewrite:
+            if context_freq:
+                self.rewrite = klass(chin, 2 * chin, 1 + 2 * context, 1, context)
+            else:
+                self.rewrite = klass(chin, 2 * chin, [1, 1 + 2 * context], 1, [0, context])
+            self.norm1 = norm_fn(2 * chin)
+
+        self.dconv = None
+        if dconv:
+            self.dconv = DConv(chin, **dconv_kw)
+
+    def forward(self, x, skip, length):
+        if self.freq and x.dim() == 3:
+            B, C, T = x.shape
+            x = x.view(B, self.chin, -1, T)
+
+        if not self.empty:
+            x = x + skip
+
+            if self.rewrite:
+                y = F.glu(self.norm1(self.rewrite(x)), dim=1)
+            else:
+                y = x
+            if self.dconv:
+                if self.freq:
+                    B, C, Fr, T = y.shape
+                    y = y.permute(0, 2, 1, 3).reshape(-1, C, T)
+                y = self.dconv(y)
+                if self.freq:
+                    y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
+        else:
+            y = x
+            assert skip is None
+        # Apply transpose convolution
+        if self.freq:
+            # Frequency domain transpose convolution using 1D with reshaping
+            B, C, Fr, T = y.shape
+            y_reshaped = y.permute(0, 3, 1, 2).reshape(B * T, C, Fr)
+            z_reshaped = self.conv_tr(y_reshaped)
+            C_out = z_reshaped.shape[1]
+            Fr_out = z_reshaped.shape[2]
+            z = z_reshaped.view(B, T, C_out, Fr_out).permute(0, 2, 3, 1)
+            z = self.norm2(z)
+            
+            if self.pad:
+                z = z[..., self.pad:-self.pad, :]
+        else:
+            z = self.norm2(self.conv_tr(y))
+            z = z[..., self.pad:self.pad + length]
+            assert z.shape[-1] == length, (z.shape[-1], length)
+        if not self.last:
+            z = F.gelu(z)
+        return z, y
+
+
 
 
 class HDemucs(nn.Module):
@@ -691,7 +959,7 @@ class HDemucs(nn.Module):
         length = x.shape[-1]
 
         z = self._spec(mix)
-        mag = self._magnitude(z).to(mix.device)
+        mag = self._magnitude(z)
         x = mag
 
         B, C, Fq, T = x.shape
@@ -772,20 +1040,8 @@ class HDemucs(nn.Module):
         x = x.view(B, S, -1, Fq, T)
         x = x * std[:, None] + mean[:, None]
 
-        # to cpu as mps doesnt support complex numbers
-        # demucs issue #435 ##432
-        # NOTE: in this case z already is on cpu
-        # TODO: remove this when mps supports complex numbers
-        x_is_mps = x.device.type == "mps"
-        if x_is_mps:
-            x = x.cpu()
-
         zout = self._mask(z, x)
         x = self._ispec(zout, length)
-
-        # back to mps device
-        if x_is_mps:
-            x = x.to('mps')
 
         if self.hybrid:
             xt = xt.view(B, S, -1, length)
