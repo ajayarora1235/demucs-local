@@ -22,8 +22,7 @@ from demucs.transformer import CrossTransformerEncoder
 from demucs.demucs import rescale_module
 from demucs.states import capture_init
 from demucs.spec import spectro, ispectro
-from demucs.hdemucs import pad1d, ScaledEmbedding, HEncLayer, MultiWrap, HDecLayer
-from models.stft_utils import STFT_Process
+from demucs.hdemucs import pad1d, ScaledEmbedding, HEncLayer, MultiWrap, HDecLayer, HEncLayerNew, HDecLayerNew
 
 class HTDemucs(nn.Module):
     """
@@ -262,7 +261,9 @@ class HTDemucs(nn.Module):
 
         for index in range(depth):
             norm = index >= norm_starts
+            print(f"index: {index}, norm: {norm}, freqs: {freqs}, kernel_size: {kernel_size}, stride: {stride}, time_stride: {time_stride}")
             freq = freqs > 1
+            print(f"freq: {freq}")
             stri = stride
             ker = kernel_size
             if not freq:
@@ -293,7 +294,7 @@ class HTDemucs(nn.Module):
                 },
             }
             kwt = dict(kw)
-            kwt["freq"] = 0
+            # kwt["freq"] = 0
             kwt["kernel_size"] = kernel_size
             kwt["stride"] = stride
             kwt["pad"] = True
@@ -307,11 +308,12 @@ class HTDemucs(nn.Module):
                 chout_z = max(chout, chout_z)
                 chout = chout_z
 
-            enc = HEncLayer(
+            enc = HEncLayerNew(
                 chin_z, chout_z, dconv=dconv_mode & 1, context=context_enc, **kw
             )
+            kwt["freq"] = 0
             if freq:
-                tenc = HEncLayer(
+                tenc = HEncLayerNew(
                     chin,
                     chout,
                     dconv=dconv_mode & 1,
@@ -331,7 +333,7 @@ class HTDemucs(nn.Module):
                     chin_z *= 2
                 if self.num_subbands > 1:
                     chin_z *= self.num_subbands
-            dec = HDecLayer(
+            dec = HDecLayerNew(
                 chout_z,
                 chin_z,
                 dconv=dconv_mode & 2,
@@ -342,7 +344,7 @@ class HTDemucs(nn.Module):
             if multi:
                 dec = MultiWrap(dec, multi_freqs)
             if freq:
-                tdec = HDecLayer(
+                tdec = HDecLayerNew(
                     chout,
                     chin,
                     dconv=dconv_mode & 2,
@@ -440,85 +442,42 @@ class HTDemucs(nn.Module):
         # Ensure minimum reasonable size
         max_frames = max(max_frames, 512)  # At least 512 frames
 
-        print("STFT_Process initialization arguments:")
-        print(f"model_type: istft_C")
-        print(f"n_fft: {self.nfft}")
-        print(f"win_length: {win_length}")
-        print(f"hop_len: {self.hop_length}")
-        print(f"max_frames: {max_frames}")
-        print(f"window_type: hann")
+        # Load precomputed ISTFT weights (these should be saved in the .th file)
+        # The weights will be loaded when the model state dict is loaded
+        print(f"HTDemucs initialized with n_fft={self.nfft}, hop_length={self.hop_length}")
+        print("ISTFT weights should be loaded from the .th file via load_state_dict()")
         
-        self.STFT_Process = STFT_Process(model_type='istft_C',
-                                         n_fft=self.nfft, 
-                                         win_length=win_length, 
-                                         hop_len=self.hop_length, 
-                                         max_frames=max_frames,
-                                         window_type='hann'
-                                         ).eval()
-
-    def _precompute_istft_basis(self):
-        """Precompute ISTFT basis matrices for CoreML compatibility"""
-        n_fft = self.nfft
-        hop_length = self.hop_length
-        win_length = n_fft // (1 + 3)  # This matches the calculation in _ispec
-        win_length = 2
+        # Calculate the correct buffer shapes based on model parameters
+        # These shapes must match what we computed in precompute_istft_weights.py
+        # For n_fft=4096, max_frames=512:
+        # - istft_inverse_basis: [4098, 1, 4096] (2*freqs, 1, n_fft) where freqs = n_fft//2 + 1 = 2049
+        # - istft_window_sum_inv: [527360] (n_fft + hop_length * (max_frames - 1))
+        freqs = self.nfft // 2 + 1  # 2049 for nfft=4096
+        inverse_basis_shape = (2 * freqs, 1, self.nfft)  # [4098, 1, 4096]
         
-        # Get device - use CPU if parameters not initialized yet
-        try:
-            device = next(self.parameters()).device
-        except StopIteration:
-            device = torch.device('cpu')
-        
-        # Create window
-        window = torch.hann_window(win_length, device=device).float()
-        if win_length < n_fft:
-            pad_left = (n_fft - win_length) // 2
-            pad_right = n_fft - win_length - pad_left
-            window = F.pad(window, (pad_left, pad_right), mode='constant', value=0)
-        
-        # Pre-compute fourier basis
-        fourier_basis = torch.fft.fft(torch.eye(n_fft, dtype=torch.float32, device=device))
-        fourier_basis = torch.vstack([
-            torch.real(fourier_basis[:n_fft//2 + 1, :]),
-            torch.imag(fourier_basis[:n_fft//2 + 1, :])
-        ]).float()
-        
-        # Create inverse basis
-        inverse_basis = window * torch.linalg.pinv((fourier_basis * n_fft) / hop_length).T.unsqueeze(1)
-        
-        # Calculate window sum for overlap-add
-        # Use the same max_frames calculation as in __init__
+        # Calculate max_frames and window_sum size
         audio_length_samples = int(self.segment * self.samplerate) // 2
         max_frames = (audio_length_samples // self.hop_length) + 1
-        max_frames = max(int(max_frames * 1.2), 512)  # Same buffer and minimum as __init__
-        n = n_fft + hop_length * (max_frames - 1)
-        window_sum = torch.zeros(n, dtype=torch.float32, device=device)
+        max_frames = max(int(max_frames * 1.2), 512)  # Same as precompute script
+        window_sum_size = self.nfft + self.hop_length * (max_frames - 1)
         
-        # Get original window and normalize it
-        original_window = torch.hann_window(win_length, device=device).float()
-        window_normalized = original_window / original_window.abs().max()
+        # Changed from register_buffer to nn.Parameter
+        self.istft_inverse_basis = nn.Parameter(torch.zeros(*inverse_basis_shape), requires_grad=False)
+        self.istft_window_sum_inv = nn.Parameter(torch.zeros(window_sum_size), requires_grad=False)
         
-        # Pad the window to n_fft for overlap-add calculation
-        if win_length < n_fft:
-            pad_left = (n_fft - win_length) // 2
-            pad_right = n_fft - win_length - pad_left
-            win_sq = F.pad(window_normalized ** 2, (pad_left, pad_right), mode='constant', value=0)
-        else:
-            win_sq = window_normalized ** 2
+        # Calculate correct shapes for STFT kernels (single channel, like ISTFT)
+        freqs = self.nfft // 2 + 1  # 2049 for nfft=4096
+        stft_kernel_shape = (freqs, 1, self.nfft)  # [2049, 1, 4096]
+        padding_shape = (1, 1, self.nfft // 2)     # [1, 1, 2048]
         
-        # Calculate overlap-add weights
-        for i in range(max_frames):
-            sample = i * hop_length
-            window_sum[sample: min(n, sample + n_fft)] += win_sq[: max(0, min(n_fft, n - sample))]
-        
-        # Calculate window sum inverse
-        window_sum_inv = n_fft / (window_sum * hop_length + 1e-7)
-        
-        # Register as buffers (these will be saved with the model)
-        self.register_buffer("istft_inverse_basis", inverse_basis)
-        self.register_buffer("istft_window_sum_inv", window_sum_inv)
+        # Changed from register_buffer to nn.Parameter
+        self.cos_kernel = nn.Parameter(torch.zeros(*stft_kernel_shape), requires_grad=False)
+        self.sin_kernel = nn.Parameter(torch.zeros(*stft_kernel_shape), requires_grad=False)
+
+
 
     def _spec(self, x):
+        print(f"_spec input x.shape: {x.shape}")
         hl = self.hop_length
         nfft = self.nfft
         x0 = x  # noqa
@@ -538,9 +497,43 @@ class HTDemucs(nn.Module):
         original_dtype = x.dtype
         x = x.float()
         x = pad1d(x, (pad, pad + le * hl - x.shape[-1]), mode="reflect")
+        print(f"After pad1d x.shape: {x.shape}")
+
+        *other, length = x.shape
+        print(f"other: {other}, length: {length}")
+        # Reshape to [batch*channels, length] then add channel dim for conv1d
+        x = x.reshape(-1, length)
+        print(f"After reshape x.shape: {x.shape}")
+
+        # Use precomputed STFT buffers (equivalent to STFT_Process stft_B_forward)
+        # Apply reflect padding
+        half_n_fft = nfft // 2
+        x_padded = F.pad(x, (half_n_fft, half_n_fft), mode='reflect')
+        # Add channel dimension for conv1d: [batch*channels, 1, padded_length]
+        x_padded = x_padded.unsqueeze(1)
+        print(f"x_padded.shape: {x_padded.shape}")
+        print(f"cos_kernel.shape: {self.cos_kernel.shape}")
+        print(f"sin_kernel.shape: {self.sin_kernel.shape}")
+        
+        # Perform STFT convolutions using precomputed kernels
+        z_real = F.conv1d(x_padded, self.cos_kernel, stride=hl)
+        z_imag = F.conv1d(x_padded, self.sin_kernel, stride=hl)
+        print(f"z_real.shape: {z_real.shape}")
+        print(f"z_imag.shape: {z_imag.shape}")
+        
+        # Apply scaling correction to balance with ISTFT (which multiplies by 64.0)
+        z_real = z_real / 64.0
+        z_imag = z_imag / 64.0
+        
+        # Combine real and imaginary parts
+        z = torch.complex(z_real, z_imag)
+        print(f"z complex.shape: {z.shape}")
+        _, freqs, frame = z.shape
+        z = z.view(*other, freqs, frame)
+        print(f"After view z.shape: {z.shape}")
         
         # Convert to float32 for STFT operations
-        z = spectro(x, nfft, hl)
+        # z = spectro(x, nfft, hl)
         # Convert to real/imaginary parts before slicing
         z = torch.view_as_real(z)
         z = z[..., :-1, :, :]
@@ -560,7 +553,7 @@ class HTDemucs(nn.Module):
         return z
 
     def _ispec(self, z, length=None, scale=0):
-        # print(scale, "SCALE")
+        # print(scale, "SCALE") #0 
         hl = self.hop_length // (4**scale)
         z = F.pad(z, (0, 0, 0, 1))
         z = F.pad(z, (2, 2))
@@ -580,12 +573,51 @@ class HTDemucs(nn.Module):
         z_imag = z.imag
         z_complex_as_real = torch.cat([z_real, z_imag], dim=1)
 
-        # # Run both methods and compare
-        x_stft_process = self.STFT_Process(z_complex_as_real, 
-                                         length=length_stft, 
-                                         hop_length=hop_length,
-                                         n_fft=n_fft)
-        x_stft_process = x_stft_process.squeeze(1)
+        # Use precomputed ISTFT buffers
+        device = z.device
+        
+        # Perform transposed convolution using precomputed inverse basis
+        inverse_transform = F.conv_transpose1d(
+            z_complex_as_real,
+            self.istft_inverse_basis,
+            stride=hop_length,
+            padding=0,
+        )
+
+        # Apply window correction and trimming
+        inverse_transform = inverse_transform.to(device)
+        output_len = inverse_transform.size(-1)
+        half_n_fft = n_fft // 2
+        start_idx = half_n_fft
+        
+        if length_stft is not None:
+            # Use provided length
+            end_idx = min(start_idx + length_stft, output_len)
+        else:
+            # Use default trimming
+            end_idx = output_len - half_n_fft
+        
+        # Ensure we don't go beyond the available length
+        end_idx = min(end_idx, output_len)
+        if start_idx >= output_len or start_idx >= end_idx:
+            # Handle edge case where output is too short
+            corrected_output = inverse_transform[:, :, :max(1, output_len)]
+        else:
+            corrected_output = inverse_transform[:, :, start_idx:end_idx]
+            
+            # Apply window sum correction only to the valid range
+            window_correction = self.istft_window_sum_inv[start_idx:end_idx]
+            if corrected_output.size(-1) != window_correction.size(0):
+                # Adjust window correction to match output size
+                min_len = min(corrected_output.size(-1), window_correction.size(0))
+                corrected_output = corrected_output[:, :, :min_len]
+                window_correction = window_correction[:min_len]
+            
+            # Ensure both tensors are on the same device before multiplication
+            window_correction = window_correction.to(corrected_output.device)
+            corrected_output = corrected_output * window_correction
+        
+        x_stft_process = corrected_output.squeeze(1)
         
         # Apply scaling correction to STFT_Process output
         x = x_stft_process * 64.0
@@ -593,7 +625,7 @@ class HTDemucs(nn.Module):
         assert length_stft == x.shape[-1]
         x = x.view(*other, length_stft)
 
-        #x = ispectro(z, hl, length=le)
+        #x = ispectro(z, hl, length=le) # original call
         x = x[..., pad: pad + length]
         return x
 
@@ -615,13 +647,13 @@ class HTDemucs(nn.Module):
         if self.cac:
             B, S, C, Fr, T = m.shape # B, S, C, Fr, T
             #  print(m.shape, "M")
-            out = m.view(B, S, -1, 2, Fr*T) ## becomes B, S, C/2, 2, Fr, T
+            out = m.view(B*S, -1, 2, Fr, T) ## becomes B*S, C/2, 2, Fr, T
             # print(out.shape, "OUT")
 
-            out = out.permute(0, 1, 2, 4, 3) ## becomes B, S, C/2, Fr*T, 2
+            out = out.permute(0, 1, 3, 4, 2) ## becomes B*S, C/2, Fr, T, 2
             # print(out.shape, "OUT PERMUTED")
-            out_real = out[..., 0] ## B, S, C/2, Fr*T
-            out_imag = out[..., 1] ## B, S, C/2, Fr*T
+            out_real = out[..., 0] ## B*S, C/2, Fr, T
+            out_imag = out[..., 1] ## B*S, C/2, Fr, T
 
             out_real = out_real.view(B, S, -1, Fr, T) ## B, S, C/2, Fr, T
             out_imag = out_imag.view(B, S, -1, Fr, T) ## B, S, C/2, Fr, T
@@ -644,8 +676,6 @@ class HTDemucs(nn.Module):
 
         B, S, C, Fq, T = mag_out.shape
         mag_out = mag_out.permute(0, 4, 3, 2, 1)
-
-        print(mix_stft.shape)
         
         # Convert complex to real/imaginary parts
         mix_stft_real = mix_stft.real.permute(0, 3, 2, 1)
@@ -812,16 +842,8 @@ class HTDemucs(nn.Module):
 
         for idx, decode in enumerate(self.decoder):
             skip = saved.pop(-1)
-            if torch.is_complex(skip):
-                print(f"skip is complex in decoder {idx}")
-            if torch.is_complex(x):
-                print(f"x is complex before decoder {idx}")
             x, pre = decode(x, skip, lengths.pop(-1))
-            if torch.is_complex(x):
-                print(f"x is complex after decoder {idx}")
             if pre is not None:
-                if torch.is_complex(pre):
-                    print(f"pre is complex in decoder {idx}")
                 pre = pre.to(model_dtype)
             x = x.to(model_dtype)
             # `pre` contains the output just before final transposed convolution,
@@ -834,18 +856,10 @@ class HTDemucs(nn.Module):
                 if tdec.empty:
                     assert pre.shape[2] == 1, pre.shape
                     pre = pre[:, :, 0]
-                    if torch.is_complex(xt):
-                        print(f"xt is complex before tdecoder {idx}")
                     xt, _ = tdec(pre, None, length_t)
-                    if torch.is_complex(xt):
-                        print(f"xt is complex after tdecoder {idx}")
                 else:
                     skip = saved_t.pop(-1)
-                    if torch.is_complex(xt):
-                        print(f"xt is complex before tdecoder {idx}")
                     xt, _ = tdec(xt, skip, length_t)
-                    if torch.is_complex(xt):
-                        print(f"xt is complex after tdecoder {idx}")
 
         # Let's make sure we used all stored skip connections.
         assert len(saved) == 0
@@ -856,19 +870,11 @@ class HTDemucs(nn.Module):
 
         if self.num_subbands > 1:
             x = x.view(B, -1, Fq, T)
-            if torch.is_complex(x):
-                print("x is complex after view 1")
             x = self.cws2cac(x)
-            if torch.is_complex(x):
-                print("x is complex after cws2cac")
 
         x = x.view(B, S, -1, Fq * self.num_subbands, T)
         x = x * std[:, None] + mean[:, None]
-        if torch.is_complex(x):
-            print("x is complex before final model_dtype conversion")
         x = x.to(model_dtype)
-        if torch.is_complex(x):
-            print("x is complex after final model_dtype conversion")
 
         zout = self._mask(z, x)
         if self.use_train_segment:
@@ -896,26 +902,6 @@ class HTDemucs(nn.Module):
         if length_pre_pad:
             x = x[..., :length_pre_pad]
         return x
-        
-        # x = xt + x
-        # Ensure final output maintains the model's precision
-        #x = x.to(model_dtype)
-        print(length_pre_pad)
-        if length_pre_pad:
-            x = x[..., :length_pre_pad]
-            xt = xt[..., :length_pre_pad]
-            
-        # Separate complex tensor into real and imaginary parts
-        if torch.is_complex(x):
-            print(x.shape, x.dtype, "X")
-            x_real = x.real
-            x_imag = x.imag
-            # Convert both parts to model_dtype
-            x_real = x_real.to(model_dtype)
-            x_imag = x_imag.to(model_dtype)
-            return x_real, x_imag, xt
-        else:
-            return x, xt  # Return both spectrogram and time branch
 
 
 def get_model(args):

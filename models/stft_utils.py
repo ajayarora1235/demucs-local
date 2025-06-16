@@ -1,3 +1,8 @@
+'''
+Source: https://github.com/DakeQQ/STFT-ISTFT-ONNX
+'''
+
+
 import numpy as np
 import torch
 
@@ -54,7 +59,7 @@ class STFT_Process(torch.nn.Module):
         window = self.create_padded_window(win_length, n_fft, window_type)
 
         # Register common buffers for all model types
-        self.register_buffer('padding_zero', torch.zeros((1, 1, self.half_n_fft), dtype=torch.float32), persistent=False)
+        self.register_buffer('padding_zero', torch.zeros((1, 1, self.half_n_fft), dtype=torch.float32))
 
         # Pre-compute model-specific buffers
         if self.model_type in ['stft_A', 'stft_B']:
@@ -66,8 +71,8 @@ class STFT_Process(torch.nn.Module):
             omega = 2 * torch.pi * frequencies * time_steps / n_fft
 
             # Register conv kernels as buffers
-            self.register_buffer('cos_kernel', (torch.cos(omega) * window.unsqueeze(0)).unsqueeze(1), persistent=False)
-            self.register_buffer('sin_kernel', (-torch.sin(omega) * window.unsqueeze(0)).unsqueeze(1), persistent=False)
+            self.register_buffer('cos_kernel', (torch.cos(omega) * window.unsqueeze(0)).unsqueeze(1))
+            self.register_buffer('sin_kernel', (-torch.sin(omega) * window.unsqueeze(0)).unsqueeze(1))
 
         if self.model_type in ['istft_A', 'istft_B', 'istft_C']:
             # ISTFT forward pass preparation
@@ -79,7 +84,6 @@ class STFT_Process(torch.nn.Module):
             ]).float()
 
             # Create forward and inverse basis
-            forward_basis = window * fourier_basis.unsqueeze(1)
             inverse_basis = window * torch.linalg.pinv((fourier_basis * n_fft) / hop_len).T.unsqueeze(1)
 
             # Calculate window sum for overlap-add
@@ -105,7 +109,6 @@ class STFT_Process(torch.nn.Module):
                 window_sum[sample: min(n, sample + n_fft)] += win_sq[: max(0, min(n_fft, n - sample))]
 
             # Register buffers (non-persistent so they don't get saved in checkpoints)
-            self.register_buffer("forward_basis", forward_basis, persistent=False)
             self.register_buffer("inverse_basis", inverse_basis, persistent=False)
             self.register_buffer("window_sum_inv",
                                  n_fft / (window_sum * hop_len + 1e-7), persistent=False)  # Add epsilon to avoid division by zero
@@ -129,27 +132,12 @@ class STFT_Process(torch.nn.Module):
     
     def forward(self, *args, **kwargs):
         # Use direct method calls instead of if-else cascade for better ONNX export
-        if self.model_type == 'stft_A':
-            return self.stft_A_forward(*args, **kwargs)
         if self.model_type == 'stft_B':
             return self.stft_B_forward(*args, **kwargs)
-        if self.model_type == 'istft_A':
-            return self.istft_A_forward(*args, **kwargs)
-        if self.model_type == 'istft_B':
-            return self.istft_B_forward(*args, **kwargs)
-        if self.model_type == 'istft_C':
+        elif self.model_type == 'istft_C':
             return self.istft_C_forward(*args, **kwargs)
         # In case none match, raise an error
         raise ValueError(f"Unknown model type: {self.model_type}")
-
-    def stft_A_forward(self, x, pad_mode='reflect' if PAD_MODE == 'reflect' else 'constant'):
-        if pad_mode == 'reflect':
-            x_padded = torch.nn.functional.pad(x, (self.half_n_fft, self.half_n_fft), mode=pad_mode)
-        else:
-            x_padded = torch.cat((self.padding_zero, x, self.padding_zero), dim=-1)
-
-        # Single conv operation
-        return torch.nn.functional.conv1d(x_padded, self.cos_kernel, stride=self.hop_len)
 
     def stft_B_forward(self, x, pad_mode='reflect' if PAD_MODE == 'reflect' else 'constant'):
         if pad_mode == 'reflect':
@@ -162,55 +150,6 @@ class STFT_Process(torch.nn.Module):
         image_part = torch.nn.functional.conv1d(x_padded, self.sin_kernel, stride=self.hop_len)
 
         return real_part, image_part
-
-    def istft_A_forward(self, magnitude, phase):
-        # Pre-compute trig values
-        cos_phase = torch.cos(phase)
-        sin_phase = torch.sin(phase)
-
-        # Prepare input for transposed convolution
-        complex_input = torch.cat((magnitude * cos_phase, magnitude * sin_phase), dim=1)
-
-        # Perform transposed convolution
-        inverse_transform = torch.nn.functional.conv_transpose1d(
-            complex_input,
-            self.inverse_basis,
-            stride=self.hop_len,
-            padding=0,
-        )
-
-        # Apply window correction
-        output_len = inverse_transform.size(-1)
-        start_idx = self.half_n_fft
-        end_idx = output_len - self.half_n_fft
-
-        return inverse_transform[:, :, start_idx:end_idx] * self.window_sum_inv[start_idx:end_idx]
-
-    def istft_B_forward(self, magnitude, real, imag):
-        # Calculate phase using atan2
-        phase = torch.atan2(imag, real)
-
-        # Pre-compute trig values directly instead of calling istft_A_forward
-        cos_phase = torch.cos(phase)
-        sin_phase = torch.sin(phase)
-
-        # Prepare input for transposed convolution
-        complex_input = torch.cat((magnitude * cos_phase, magnitude * sin_phase), dim=1)
-
-        # Perform transposed convolution
-        inverse_transform = torch.nn.functional.conv_transpose1d(
-            complex_input,
-            self.inverse_basis,
-            stride=self.hop_len,
-            padding=0,
-        )
-
-        # Apply window correction
-        output_len = inverse_transform.size(-1)
-        start_idx = self.half_n_fft
-        end_idx = output_len - self.half_n_fft
-
-        return inverse_transform[:, :, start_idx:end_idx] * self.window_sum_inv[start_idx:end_idx]
 
     def istft_C_forward(self, z, length=None, hop_length=None, n_fft=None):
         # z should be a real tensor with shape [batch, 2*freqs, frames]
@@ -225,21 +164,13 @@ class STFT_Process(torch.nn.Module):
         # Use precomputed buffers for efficiency, but ensure they're on the right device
         device = z.device
 
+        # torch iSTFT scenario (for testing)
         # Split the input tensor into real and imaginary parts
         # real_part = z[:, :z.size(1)//2, :]
         # imag_part = z[:, z.size(1)//2:, :]
         # z = torch.complex(real_part, imag_part)
-
         #result = torch.istft(z.cpu(), n_fft=n_fft, hop_length=hop_length, length=length)
         #return result
-        
-        # Move buffers to the same device as input if needed
-        # if self.inverse_basis.device != device:
-        #     self.inverse_basis = self.inverse_basis.to(device)
-        #     self.window_sum_inv = self.window_sum_inv.to(device)
-        
-        # inverse_basis = self.inverse_basis
-        # window_sum_inv = self.window_sum_inv
         
         # Perform transposed convolution
         inverse_transform = torch.nn.functional.conv_transpose1d(
