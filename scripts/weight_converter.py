@@ -1,139 +1,98 @@
 """
-Correct weight conversion for HTDemucs architecture:
-- Encoders: HEncLayerNew (1D) - convert weights from 2D to 1D
-- Decoders: HDecLayerNew (1D) - convert weights to 1D
+Weight conversion utility for converting 2D convolution weights to 1D convolution weights.
+This is needed when loading checkpoints from original 2D models into modified 1D models.
 """
 import torch
+import re
 
-def convert_htdemucs_weights(state_dict):
+def convert_2d_to_1d_weights(state_dict):
     """
-    Convert weights for HTDemucs architecture:
-    - Convert encoder weights from 2D to 1D (for HEncLayerNew)
-    - Convert decoder weights to 1D (for HDecLayerNew)
+    Convert 2D convolution weights to 1D convolution weights.
+    
+    Args:
+        state_dict: Original state dict with 2D weights
+        
+    Returns:
+        converted_state_dict: State dict with 1D weights
     """
     converted_state_dict = {}
     
     for key, value in state_dict.items():
-        if 'decoder' in key and 'conv_tr.weight' in key:
-            # Convert decoder main conv weights: [out, in, k, 1] -> [out, in, k]
-            if value.dim() == 4 and value.shape[3] == 1:
-                converted_value = value.squeeze(3)
-                print(f"Converted decoder conv {key}: {value.shape} -> {converted_value.shape}")
-                converted_state_dict[key] = converted_value
+        if 'conv.weight' in key or 'conv_tr.weight' in key:
+            # Handle main convolution weights
+            if value.dim() == 4:  # [out_channels, in_channels, kernel_h, kernel_w]
+                if value.shape[3] == 1:  # kernel_w == 1, can squeeze
+                    converted_value = value.squeeze(3)  # Remove time dimension
+                    print(f"Converted {key}: {value.shape} -> {converted_value.shape}")
+                    converted_state_dict[key] = converted_value
+                else:
+                    # This shouldn't happen for frequency domain convolutions
+                    print(f"Warning: Cannot convert {key} with shape {value.shape}")
+                    converted_state_dict[key] = value
             else:
-                print(f"Warning: Cannot convert decoder conv {key} with shape {value.shape}")
                 converted_state_dict[key] = value
-                
-        elif 'decoder' in key and 'rewrite.weight' in key:
-            # Keep decoder rewrite weights unchanged - they should match HDecLayerNew expectations
-            print(f"Keeping decoder rewrite unchanged: {key} {value.shape}")
-            converted_state_dict[key] = value
-                
-        elif 'tdecoder' in key and 'conv_tr.weight' in key:
-            # Time decoder conv weights - should already be 1D or convert if needed
-            if value.dim() == 3:
-                # Already 1D, keep as is
-                print(f"Keeping tdecoder conv unchanged (already 1D): {key} {value.shape}")
-                converted_state_dict[key] = value
-            elif value.dim() == 4 and value.shape[3] == 1:
-                converted_value = value.squeeze(3)
-                print(f"Converted tdecoder conv {key}: {value.shape} -> {converted_value.shape}")
-                converted_state_dict[key] = converted_value
-            else:
-                print(f"Warning: Cannot convert tdecoder conv {key} with shape {value.shape}")
-                converted_state_dict[key] = value
-                
-        elif 'tdecoder' in key and 'rewrite.weight' in key:
-            # Keep time decoder rewrite weights unchanged - they should match HDecLayerNew expectations
-            print(f"Keeping tdecoder rewrite unchanged: {key} {value.shape}")
-            converted_state_dict[key] = value
-                
-        elif ('encoder' in key or 'tencoder' in key) and 'conv.weight' in key:
-            # Convert encoder main conv weights for HEncLayerNew
-            if value.dim() == 4 and value.shape[3] == 1:
-                # Convert frequency domain: [out, in, kernel_freq, 1] -> [out, in, kernel_freq]
-                converted_value = value.squeeze(3)
-                print(f"Converted encoder conv (freq) {key}: {value.shape} -> {converted_value.shape}")
-                converted_state_dict[key] = converted_value
-            elif value.dim() == 3:
-                # Time domain weights are already 1D, copy directly
-                print(f"Copied encoder conv (time) {key}: {value.shape}")
-                converted_state_dict[key] = value
-            else:
-                print(f"Warning: Unexpected encoder conv shape {key}: {value.shape}")
-                converted_state_dict[key] = value
-                
-        elif ('encoder' in key or 'tencoder' in key) and 'rewrite.weight' in key:
-            # Convert encoder rewrite weights for HEncLayerNew
-            if value.dim() == 4:
-                # Convert frequency domain: [out, in, 1, 1] -> [out, in, 1]
-                converted_value = value.squeeze(3).squeeze(2).unsqueeze(2)
-                print(f"Converted encoder rewrite (freq) {key}: {value.shape} -> {converted_value.shape}")
-                converted_state_dict[key] = converted_value
-            elif value.dim() == 3:
-                # Time domain rewrite weights are already 1D, copy directly
-                print(f"Copied encoder rewrite (time) {key}: {value.shape}")
-                converted_state_dict[key] = value
-            else:
-                print(f"Warning: Unexpected encoder rewrite shape {key}: {value.shape}")
-                converted_state_dict[key] = value
-                
         else:
-            # Keep all other weights unchanged (norms, embeddings, etc.)
+            # Keep all other weights unchanged
             converted_state_dict[key] = value
     
     return converted_state_dict
 
-def main():
-    checkpoint_path = "checkpoints/demucs_with_stft_istft.th"
-    output_path = "checkpoints/demucs_with_stft_istft_htdemucs.th"
+def load_converted_weights(model, checkpoint_path):
+    """
+    Load weights from checkpoint with automatic 2D->1D conversion.
     
-    print("Converting weights for HTDemucs architecture...")
-    print("- Encoders: HEncLayerNew (1D) - convert weights from 2D to 1D")
-    print("- Decoders: HDecLayerNew (1D) - convert weights to 1D")
-    print(f"Input: {checkpoint_path}")
-    print(f"Output: {output_path}")
-    print("=" * 70)
-    
-    # Load original checkpoint
-    print("Loading original checkpoint...")
+    Args:
+        model: PyTorch model with 1D convolutions
+        checkpoint_path: Path to checkpoint with 2D weights
+    """
+    print(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    # Get state dict
-    if 'state' in checkpoint:
-        state_dict = checkpoint['state']
-        print("Found 'state' key in checkpoint (Demucs format)")
+    # Extract state dict (handle different checkpoint formats)
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif 'model' in checkpoint:
+        state_dict = checkpoint['model']
     else:
         state_dict = checkpoint
-        print("Using checkpoint directly as state_dict")
-    
-    print(f"Number of parameters in original model: {len(state_dict)}")
     
     # Convert weights
-    print("\nConverting weights...")
-    converted_state_dict = convert_htdemucs_weights(state_dict)
+    print("Converting 2D weights to 1D...")
+    converted_state_dict = convert_2d_to_1d_weights(state_dict)
     
-    print(f"Number of parameters in converted model: {len(converted_state_dict)}")
+    # Load converted weights
+    try:
+        missing_keys, unexpected_keys = model.load_state_dict(converted_state_dict, strict=False)
+        if missing_keys:
+            print(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys}")
+        print("✅ Successfully loaded converted weights!")
+        return True
+    except Exception as e:
+        print(f"❌ Error loading converted weights: {e}")
+        return False
+
+# Example usage:
+if __name__ == "__main__":
+    # Example of how to use this
+    print("Weight Converter for 2D->1D Convolution Models")
+    print("=" * 50)
     
-    # Update checkpoint
-    if 'state' in checkpoint:
-        checkpoint['state'] = converted_state_dict
-    else:
-        checkpoint = converted_state_dict
+    # Load and convert a checkpoint
+    checkpoint_path = "path/to/your/checkpoint.pth"
+    
+    # Load original checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    original_state_dict = checkpoint.get('state_dict', checkpoint)
+    
+    # Convert weights
+    converted_state_dict = convert_2d_to_1d_weights(original_state_dict)
     
     # Save converted checkpoint
-    print(f"\nSaving HTDemucs checkpoint to: {output_path}")
-    torch.save(checkpoint, output_path)
+    converted_checkpoint = checkpoint.copy()
+    converted_checkpoint['state_dict'] = converted_state_dict
     
-    print("✅ HTDemucs conversion complete!")
-    print("\n" + "="*70)
-    print("SUMMARY:")
-    print("✅ Encoder conv weights: Converted from 2D to 1D (for HEncLayerNew)")
-    print("✅ Encoder rewrite weights: Converted from 2D to 1D (for HEncLayerNew)")
-    print("✅ Decoder conv weights: Converted to 1D (for HDecLayerNew)")
-    print("✅ Decoder rewrite weights: Kept unchanged (for HDecLayerNew)")
-    print("✅ No 2D convolutions with mixed strides [4,1] - using pure 1D convolutions!")
-    print("✅ This checkpoint works with your HTDemucs model!")
-
-if __name__ == "__main__":
-    main() 
+    output_path = checkpoint_path.replace('.pth', '_converted_1d.pth')
+    torch.save(converted_checkpoint, output_path)
+    print(f"Saved converted checkpoint to: {output_path}") 

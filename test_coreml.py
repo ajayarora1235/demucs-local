@@ -16,7 +16,7 @@ def load_audio(audio_path: str, sample_rate: int = 44100) -> Tuple[np.ndarray, i
         print(f'Error message: {str(e)}')
         exit()
 
-def process_chunks(audio: np.ndarray, model: ct.models.MLModel, chunk_size: int = 65536, num_chunks: int = 10) -> np.ndarray:
+def process_chunks(audio: np.ndarray, model: ct.models.MLModel, chunk_size: int = 44100, num_chunks: int = 10) -> np.ndarray:
     """Process audio in chunks through CoreML model."""
     # Ensure audio is 2D (channels, samples)
     if len(audio.shape) == 1:
@@ -44,6 +44,13 @@ def process_chunks(audio: np.ndarray, model: ct.models.MLModel, chunk_size: int 
         # Run through model
         result = model.predict({"audio_input": model_input})
         separated_audio = result['separated_audio']
+
+        ## print output stats
+        print(f"Output shape: {separated_audio.shape}")
+        print(f"Output min: {separated_audio.min():.6f}")
+        print(f"Output max: {separated_audio.max():.6f}")
+        print(f"Output mean: {separated_audio.mean():.6f}")
+        print(f"Output non-zero elements: {np.count_nonzero(separated_audio)}")
         
         # Add to output
         chunk_length = end_idx - i
@@ -55,7 +62,7 @@ def process_chunks(audio: np.ndarray, model: ct.models.MLModel, chunk_size: int 
 
 def main():
     # Load CoreML model
-    model_path = "demucs_correct_weightloading.mlpackage"
+    model_path = "demucs_correct_stft_torch.mlpackage"
     model = ct.models.MLModel(model_path)
     
     # Create output directory if it doesn't exist

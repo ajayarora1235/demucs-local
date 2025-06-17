@@ -103,22 +103,6 @@ class HEncLayer(nn.Module):
         self.norm = norm
         self.pad = pad
 
-        ## print all arguments
-        print("HEncLayer arguments:")
-        print(f"chin: {chin}")
-        print(f"chout: {chout}")
-        print(f"kernel_size: {kernel_size}")
-        print(f"stride: {stride}")
-        print(f"norm: {norm}")
-        print(f"context: {context}")
-        print(f"dconv: {dconv}")
-        print(f"dconv_kw: {dconv_kw}")
-        print(f"pad: {pad}")
-        print(f"rewrite: {rewrite}")
-        print(f"freq: {freq}")
-        print(f"empty: {empty}")
-
-
         if freq:
             kernel_size = [kernel_size, 1]
             stride = [stride, 1]
@@ -198,7 +182,11 @@ class HEncLayerNew(nn.Module):
         norm_fn = lambda d: nn.Identity()  # noqa
         if norm:
             norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa
-        
+        if pad:
+            pad = kernel_size // 4
+        else:
+            pad = 0
+        klass=nn.Conv1d
         self.freq = freq
         self.kernel_size = kernel_size
         self.stride = stride
@@ -208,20 +196,12 @@ class HEncLayerNew(nn.Module):
         
         if freq:
             # Use 1D conv along frequency axis
-            kernel_size = kernel_size
-            stride = stride
-            pad = kernel_size // 4 if pad else 0
-            klass = nn.Conv1d
+            klass = nn.Conv2d
             self.use_freq_reshape = True
         else:
-            if pad:
-                pad = kernel_size // 4
-            else:
-                pad = 0
-            klass = nn.Conv1d
             self.use_freq_reshape = False
             
-        self.conv = klass(chin, chout, kernel_size, stride, pad)
+        self.conv = nn.Conv1d(chin, chout, kernel_size, stride, pad)
         if self.empty:
             return
         self.norm1 = norm_fn(chout)
@@ -251,12 +231,10 @@ class HEncLayerNew(nn.Module):
             B, C, Fr, T = x.shape
             x = x.view(B, -1, T)
 
-        # CRITICAL FIX: Add missing time domain padding logic
         if not self.freq:
             le = x.shape[-1]
             if not le % self.stride == 0:
                 x = F.pad(x, (0, self.stride - (le % self.stride)))
-
         y = self.conv(x)
         
         if self.empty:
@@ -273,6 +251,14 @@ class HEncLayerNew(nn.Module):
             B, C, Fr, T = original_shape
             y = y.view(B, T, C_out, Fr_out).permute(0, 2, 3, 1)  # [B, C_out, Fr_out, T]
         
+        ## add inject logic
+        if inject is not None:
+            assert inject.shape[-1] == y.shape[-1], (inject.shape, y.shape)
+            if inject.dim() == 3 and y.dim() == 4:
+                inject = inject[:, :, None]
+            y = y + inject
+        
+        
         # Apply normalization on 4D tensor (same as original)
         y = F.gelu(self.norm1(y))
         if self.dconv:
@@ -283,16 +269,7 @@ class HEncLayerNew(nn.Module):
             if self.freq:
                 y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
         if self.rewrite:
-            if self.freq and hasattr(self, 'use_freq_reshape') and self.use_freq_reshape:
-                # Apply rewrite convolution using 1D approach with reshaping
-                B, C, Fr, T = y.shape
-                y_reshaped = y.permute(0, 3, 1, 2).reshape(B * T, C, Fr)
-                z_reshaped = self.rewrite(y_reshaped)
-                C_out = z_reshaped.shape[1]
-                z = z_reshaped.view(B, T, C_out, Fr).permute(0, 2, 3, 1)
-                z = self.norm2(z)
-            else:
-                z = self.norm2(self.rewrite(y))
+            z = self.norm2(self.rewrite(y))
             z = F.glu(z, dim=1)
         else:
             z = y

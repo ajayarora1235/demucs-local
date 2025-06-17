@@ -6,7 +6,7 @@ from weight_converter import convert_2d_to_1d_weights
 
 def main():
     checkpoint_path = "checkpoints/demucs_with_stft_istft.th"
-    output_path = "checkpoints/demucs_with_stft_istft_1d.th"
+    output_path = "checkpoints/demucs_with_stft_istft_1d_conv_only.th"
     
     print("Converting checkpoint from 2D to 1D convolutions...")
     print(f"Input: {checkpoint_path}")
